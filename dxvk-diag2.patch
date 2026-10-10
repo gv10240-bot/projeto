@@ -1,0 +1,326 @@
+diff -ruN a/src/dxvk/dxvk_context.cpp c/src/dxvk/dxvk_context.cpp
+--- a/src/dxvk/dxvk_context.cpp	2026-10-09 18:31:42.354346667 +0000
++++ c/src/dxvk/dxvk_context.cpp	2026-10-10 12:39:23.917101127 +0000
+@@ -4,6 +4,7 @@
+ 
+ #include "dxvk_device.h"
+ #include "dxvk_context.h"
++#include "dxvk_diag.h"
+ 
+ namespace dxvk {
+   
+@@ -4043,6 +4044,18 @@
+ 
+     if (unlikely(m_state.cp.pipeline == nullptr))
+       return false;
++
++    { // diagnostics: remember the bound compute shader
++      static thread_local std::string lastCs;
++      std::string cur = "CS";
++      if (m_state.cp.shaders.cs != nullptr)
++        cur += " " + m_state.cp.shaders.cs->debugName();
++      if (cur != lastCs) {
++        lastCs = cur;
++        DxvkDiag::record(cur);
++        DxvkDiag::skipCs = DxvkDiag::matchesSkip(cur);
++      }
++    }
+     
+     if (m_state.cp.pipeline->layout()->pushConstRange().size)
+       m_flags.set(DxvkContextFlag::DirtyPushConstants);
+@@ -4093,6 +4106,22 @@
+       return false;
+     }
+ 
++    { // diagnostics: remember the bound graphics shaders
++      static thread_local std::string lastGp;
++      const auto& sh = m_state.gp.shaders;
++      std::string cur = "GFX";
++      if (sh.vs  != nullptr) cur += " VS="  + sh.vs->debugName();
++      if (sh.tcs != nullptr) cur += " TCS=" + sh.tcs->debugName();
++      if (sh.tes != nullptr) cur += " TES=" + sh.tes->debugName();
++      if (sh.gs  != nullptr) cur += " GS="  + sh.gs->debugName();
++      if (sh.fs  != nullptr) cur += " FS="  + sh.fs->debugName();
++      if (cur != lastGp) {
++        lastGp = cur;
++        DxvkDiag::record(cur);
++        DxvkDiag::skipGfx = DxvkDiag::matchesSkip(cur);
++      }
++    }
++
+     if (m_state.gp.flags != m_state.gp.pipeline->flags()) {
+       m_state.gp.flags = m_state.gp.pipeline->flags();
+ 
+@@ -4782,6 +4811,9 @@
+       if (unlikely(!this->updateComputePipeline()))
+         return false;
+     }
++
++    if (unlikely(DxvkDiag::skipCs))
++      return false;
+     
+     if (m_flags.any(
+           DxvkContextFlag::CpDirtyResources,
+@@ -4806,6 +4838,9 @@
+       if (unlikely(!this->updateGraphicsPipeline()))
+         return false;
+     }
++
++    if (unlikely(DxvkDiag::skipGfx))
++      return false;
+     
+     if (m_state.gp.flags.any(DxvkGraphicsPipelineFlag::HasStorageDescriptors,
+                              DxvkGraphicsPipelineFlag::HasTransformFeedback)) {
+diff -ruN a/src/dxvk/dxvk_diag.h c/src/dxvk/dxvk_diag.h
+--- a/src/dxvk/dxvk_diag.h	1970-01-01 00:00:00.000000000 +0000
++++ c/src/dxvk/dxvk_diag.h	2026-10-10 12:39:23.914530594 +0000
+@@ -0,0 +1,151 @@
++#pragma once
++
++#include <atomic>
++#include <cctype>
++#include <cstdint>
++#include <cstring>
++#include <set>
++#include <string>
++#include <vector>
++
++#include "../util/log/log.h"
++#include "../util/util_env.h"
++#include "../util/util_string.h"
++
++namespace dxvk {
++
++  /**
++   * \brief Diagnostic ring buffer
++   *
++   * Remembers which shaders were bound recently and, when the
++   * GPU is lost, prints the ones that belong to the command
++   * list that most likely caused the failure.
++   */
++  class DxvkDiag {
++    constexpr static uint32_t RingSize = 4096;
++    constexpr static uint32_t TextSize = 300;
++
++    struct Entry {
++      uint64_t seq;
++      char     text[TextSize];
++    };
++
++  public:
++
++    /** Remember a shader binding for the command list being recorded */
++    static void record(const std::string& text) {
++      uint64_t idx = head.fetch_add(1, std::memory_order_relaxed);
++      Entry& e = ring[idx % RingSize];
++      e.seq = submitted.load(std::memory_order_relaxed) + 1;
++      std::strncpy(e.text, text.c_str(), TextSize - 1);
++      e.text[TextSize - 1] = '\0';
++    }
++
++    /** A command list was handed to the submission queue */
++    static void markSubmitted() {
++      submitted.fetch_add(1, std::memory_order_relaxed);
++    }
++
++    /** A command list finished on the GPU without errors */
++    static void markFinished() {
++      finished.fetch_add(1, std::memory_order_relaxed);
++    }
++
++    /**
++     * \brief Checks the shader names against DXVK_SKIP_SHADERS
++     *
++     * DXVK_SKIP_SHADERS is a list of text pieces (for example the
++     * first 8 characters of a shader hash), separated by commas.
++     * Draws and dispatches that use a matching shader are skipped.
++     * Only meant to be called from the context thread.
++     */
++    static bool matchesSkip(const std::string& names) {
++      static const std::vector<std::string> list = parseSkipList();
++
++      if (list.empty())
++        return false;
++
++      std::string lower = names;
++      for (char& c : lower)
++        c = char(std::tolower((unsigned char)c));
++
++      for (const std::string& item : list) {
++        if (lower.find(item) != std::string::npos) {
++          static std::set<std::string> logged;
++
++          if (logged.insert(names).second)
++            Logger::err(str::format("DIAG: skipping draws that use: ", names));
++
++          return true;
++        }
++      }
++
++      return false;
++    }
++
++    /** Print the suspect command lists. Runs only once. */
++    static void dump() {
++      bool expected = false;
++      if (!dumped.compare_exchange_strong(expected, true))
++        return;
++
++      uint64_t fin = finished.load();
++      uint64_t sub = submitted.load();
++      uint64_t bad = fin + 1;
++
++      Logger::err(str::format("DIAG: GPU lost. command lists submitted=", sub,
++        " finished_ok=", fin, " suspect=#", bad, " (also showing #", bad - 1, " and #", bad + 1, ")"));
++
++      uint64_t h = head.load();
++      uint64_t n = h < RingSize ? h : RingSize;
++      uint64_t printed = 0;
++
++      for (uint64_t i = h - n; i < h && printed < 400; i++) {
++        const Entry& e = ring[i % RingSize];
++
++        if (e.seq + 1 >= bad && e.seq <= bad + 1) {
++          Logger::err(str::format("DIAG list#", e.seq, ": ", e.text));
++          printed += 1;
++        }
++      }
++
++      Logger::err("DIAG: end of dump");
++    }
++
++    inline static bool skipGfx = false;
++    inline static bool skipCs  = false;
++
++  private:
++
++    static std::vector<std::string> parseSkipList() {
++      std::vector<std::string> result;
++      std::string env = env::getEnvVar("DXVK_SKIP_SHADERS");
++      std::string cur;
++
++      for (size_t i = 0; i <= env.size(); i++) {
++        char c = i < env.size() ? env[i] : ',';
++
++        if (c == ',' || c == ';' || c == ' ') {
++          if (!cur.empty())
++            result.push_back(cur);
++          cur.clear();
++        } else {
++          cur.push_back(char(std::tolower((unsigned char)c)));
++        }
++      }
++
++      if (!result.empty())
++        Logger::err(str::format("DIAG: DXVK_SKIP_SHADERS has ", result.size(), " entries"));
++
++      return result;
++    }
++
++    inline static Entry                 ring[RingSize];
++    inline static std::atomic<uint64_t> head      { 0 };
++    inline static std::atomic<uint64_t> submitted { 0 };
++    inline static std::atomic<uint64_t> finished  { 0 };
++    inline static std::atomic<bool>     dumped    { false };
++
++  };
++
++}
+diff -ruN a/src/dxvk/dxvk_queue.cpp c/src/dxvk/dxvk_queue.cpp
+--- a/src/dxvk/dxvk_queue.cpp	2026-10-09 18:31:42.360559018 +0000
++++ c/src/dxvk/dxvk_queue.cpp	2026-10-10 12:39:23.764530901 +0000
+@@ -1,5 +1,6 @@
+ #include "dxvk_device.h"
+ #include "dxvk_queue.h"
++#include "dxvk_diag.h"
+ 
+ namespace dxvk {
+   
+@@ -35,6 +36,7 @@
+     entry.submit = std::move(submitInfo);
+ 
+     m_pending += 1;
++    DxvkDiag::markSubmitted();
+     m_submitQueue.push(std::move(entry));
+     m_appendCond.notify_all();
+   }
+@@ -127,6 +129,7 @@
+           m_finishQueue.push(std::move(entry));
+       } else if (status == VK_ERROR_DEVICE_LOST || entry.submit.cmdList != nullptr) {
+         Logger::err(str::format("DxvkSubmissionQueue: Command submission failed: ", status));
++        DxvkDiag::dump();
+         m_lastError = status;
+         m_device->waitForIdle();
+       }
+@@ -165,8 +168,12 @@
+       if (status != VK_ERROR_DEVICE_LOST)
+         status = entry.submit.cmdList->synchronize();
+       
++      if (status == VK_SUCCESS)
++        DxvkDiag::markFinished();
++
+       if (status != VK_SUCCESS) {
+         Logger::err(str::format("DxvkSubmissionQueue: Failed to sync fence: ", status));
++        DxvkDiag::dump();
+         m_lastError = status;
+         m_device->waitForIdle();
+       }
+diff -ruN a/src/util/config/config.cpp c/src/util/config/config.cpp
+--- a/src/util/config/config.cpp	2026-10-09 18:31:42.370709921 +0000
++++ c/src/util/config/config.cpp	2026-10-10 12:39:23.918278326 +0000
+@@ -831,6 +831,33 @@
+   }
+ 
+ 
++  // Applies options from $DXVK_CONFIG, formatted as
++  // "option = value; other.option = value"
++  static void applyEnvConfig(Config& config) {
++    std::string env = env::getEnvVar("DXVK_CONFIG");
++
++    if (env.empty())
++      return;
++
++    Logger::info(str::format("Applying DXVK_CONFIG: ", env));
++
++    ConfigContext ctx;
++    ctx.active = true;
++
++    size_t pos = 0;
++
++    while (pos <= env.size()) {
++      size_t end = env.find(';', pos);
++
++      if (end == std::string::npos)
++        end = env.size();
++
++      parseUserConfigLine(config, ctx, env.substr(pos, end - pos));
++      pos = end + 1;
++    }
++  }
++
++
+   Config Config::getUserConfig() {
+     Config config;
+ 
+@@ -843,8 +870,10 @@
+     // Open the file if it exists
+     std::ifstream stream(str::tows(filePath.c_str()).c_str());
+ 
+-    if (!stream)
++    if (!stream) {
++      applyEnvConfig(config);
+       return config;
++    }
+     
+     // Inform the user that we loaded a file, might
+     // help when debugging configuration issues
+@@ -859,7 +888,8 @@
+ 
+     while (std::getline(stream, line))
+       parseUserConfigLine(config, ctx, line);
+-    
++
++    applyEnvConfig(config);
+     return config;
+   }
+ 
